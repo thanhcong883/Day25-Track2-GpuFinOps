@@ -60,21 +60,89 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: float | None = None,
+    period_days: float = 30.0,
+    reserved_discount_1yr: float = 0.25,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
+    Base v1 policy (default — used by the graded M3 pipeline, `gpu_type`/`job_days` omitted):
       - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
       - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
       - otherwise                 -> 'on_demand' (spiky / low duty)
+
+    Extension 1 policy (pass `gpu_type` and/or `job_days`) adds two factors v1 ignores:
+      - interruption rate varies by GPU type (`INTERRUPT_RATE_BY_GPU`) — H100 spot is rarely
+        reclaimed (high demand, deep pools); A10G/L4 spot is reclaimed far more often, so
+        "interruptible" alone isn't enough to justify spot on those GPUs.
+      - a job only active a fraction of the billing period (`job_days` out of `period_days`,
+        e.g. a 2-week training burst within a 30-day month) isn't steady enough to amortize a
+        3yr lock-in even at a high hourly duty cycle while it runs — it's compared against the
+        1yr reserved discount instead.
     """
     duty = max(0.0, hours_per_day) / 24.0
-    be = break_even_utilization(reserved_discount)
-    if interruptible and hours_per_day < 24:
+    be_3yr = break_even_utilization(reserved_discount)
+
+    if gpu_type is None and job_days is None:
+        if interruptible and hours_per_day < 24:
+            return "spot"
+        if duty >= be_3yr:
+            return "reserved"
+        return "on_demand"
+
+    irate = INTERRUPT_RATE_BY_GPU.get(gpu_type, 0.05)
+    be_1yr = break_even_utilization(reserved_discount_1yr)
+    safe_spot = interruptible and hours_per_day < 24 and irate <= 0.08
+
+    # A safely-interruptible job on a low-reclaim GPU beats reserved at any duty cycle —
+    # spot (~40-60% off) undercuts even a 3yr reserved commit (45% off), so check it first.
+    if safe_spot:
         return "spot"
-    if duty >= be:
-        return "reserved"
+    steady = job_days is None or period_days <= 0 or (job_days / period_days) >= 0.85
+    if duty >= be_3yr:
+        if not steady:
+            return "reserved_1yr" if duty >= be_1yr else "on_demand"
+        return "reserved_3yr"
+    if duty >= be_1yr:
+        return "reserved_1yr"
     return "on_demand"
+
+
+# Extension 1: illustrative per-hour reclaim probability by GPU type. H100/H200 are the
+# capacity everyone wants for training, so cloud providers reclaim spot slices on them
+# less often; A10G/L4 are cheap "leftover capacity" tiers reclaimed much more readily.
+INTERRUPT_RATE_BY_GPU = {"H100": 0.03, "H200": 0.03, "A100": 0.05, "A10G": 0.10, "L4": 0.12}
+
+
+def cache_breakeven_reads(write_cost_per_m: float, price_in_per_m: float,
+                          read_discount: float = 0.10) -> float:
+    """Minimum reuse count of a cached prefix before caching pays for itself.
+
+    Writing a cache costs `write_cost_per_m` $/1M tokens once (a premium over normal input
+    price). Each later read then costs `read_discount x price_in_per_m` instead of the full
+    price, saving `(1 - read_discount) * price_in_per_m` per read. Break-even is the read
+    count where cumulative savings cover the one-time write premium.
+    """
+    saved_per_read = price_in_per_m * (1.0 - read_discount)
+    if saved_per_read <= 0:
+        return float("inf")
+    return write_cost_per_m / saved_per_read
+
+
+def cache_is_worth_it(avg_cache_reads: float, write_cost_per_m: float,
+                      price_in_per_m: float, read_discount: float = 0.10) -> bool:
+    """True if a cached prefix is reused often enough to cover its write cost.
+
+    Extension 3: prompt caching is only a net saving once `avg_cache_reads` clears
+    `cache_breakeven_reads()` — a prefix read once or twice may cost more than it saves.
+    """
+    breakeven = cache_breakeven_reads(write_cost_per_m, price_in_per_m, read_discount)
+    return avg_cache_reads >= breakeven
 
 
 def spot_checkpoint_cost(
